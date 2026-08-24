@@ -70,3 +70,23 @@ def test_c_abi_handles_unaligned_read_buffers(name, words):
         result.ctypes.data,
     )
     assert result.tobytes() == getattr(upstream, f"highwayhash_{words * 64}")(KEY, message)
+
+
+@pytest.mark.parametrize("length", range(32))
+@pytest.mark.parametrize("name, words", [("mhh64", 1), ("mhh128", 2), ("mhh256", 4)])
+def test_simd_update_all_tail_lengths_from_unaligned_buffers(name, words, length):
+    key = (ctypes.c_ubyte * 33)()
+    data = (ctypes.c_ubyte * 32)()
+    for i, value in enumerate(KEY):
+        key[i + 1] = value
+    for i, value in enumerate(DATA[:length]):
+        data[i + 1] = value
+    result = np.empty(words, dtype=np.uint64)
+    getattr(lib(), name)(
+        ctypes.addressof(key) + 1,
+        ctypes.addressof(data) + 1,
+        length,
+        result.ctypes.data,
+    )
+    expected = getattr(upstream, f"highwayhash_{words * 64}")(KEY, DATA[:length])
+    assert result.tobytes() == expected

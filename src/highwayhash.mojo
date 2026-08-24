@@ -1,30 +1,26 @@
 """HighwayHash's four-lane portable core, exposed as a small C ABI."""
 
+from std.memory import bitcast
+
 comptime U64x4 = SIMD[DType.uint64, 4]
 comptime U8Ptr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
 comptime MASK32 = UInt64(0xFFFFFFFF)
 
 
-def rotate64_by32(x: UInt64) -> UInt64:
+@always_inline
+def rotate64x4_by32(x: U64x4) -> U64x4:
     return (x >> 32) | (x << 32)
 
 
-def zipper_merge(v1: UInt64, v0: UInt64) -> Tuple[UInt64, UInt64]:
-    var a0 = ((v0 & (UInt64(0xFF) << 24)) + (v1 & (UInt64(0xFF) << 32))) >> 24
-    a0 += ((v0 & (UInt64(0xFF) << 40)) + (v1 & (UInt64(0xFF) << 48))) >> 16
-    a0 += v0 & (UInt64(0xFF) << 16)
-    a0 += (v0 & (UInt64(0xFF) << 8)) << 32
-    a0 += (v1 & (UInt64(0xFF) << 56)) >> 8
-    a0 += v0 << 56
-    var a1 = ((v1 & (UInt64(0xFF) << 24)) + (v0 & (UInt64(0xFF) << 32))) >> 24
-    a1 += v1 & (UInt64(0xFF) << 16)
-    a1 += (v1 & (UInt64(0xFF) << 40)) >> 16
-    a1 += (v1 & (UInt64(0xFF) << 8)) << 24
-    a1 += (v0 & (UInt64(0xFF) << 48)) >> 8
-    a1 += (v1 & UInt64(0xFF)) << 48
-    a1 += v0 & (UInt64(0xFF) << 56)
-    return (a0, a1)
+@always_inline
+def zipper_merge(v: U64x4) -> U64x4:
+    var bytes = bitcast[DType.uint8, 32](v)
+    var merged = bytes.shuffle[
+        3, 12, 2, 5, 14, 1, 15, 0, 11, 4, 10, 13, 9, 6, 8, 7,
+        19, 28, 18, 21, 30, 17, 31, 16, 27, 20, 26, 29, 25, 22, 24, 23,
+    ]()
+    return bitcast[DType.uint64, 4](merged)
 
 
 @always_inline
@@ -36,18 +32,8 @@ def update(v0: U64x4, v1: U64x4, mul0: U64x4, mul1: U64x4,
     next_v0 += mul1
     var next_mul1 = mul1 ^ ((next_v0 & U64x4(MASK32)) * (next_v1 >> 32))
 
-    var add0, add1 = zipper_merge(next_v1[1], next_v1[0])
-    next_v0[0] += add0
-    next_v0[1] += add1
-    add0, add1 = zipper_merge(next_v1[3], next_v1[2])
-    next_v0[2] += add0
-    next_v0[3] += add1
-    add0, add1 = zipper_merge(next_v0[1], next_v0[0])
-    next_v1[0] += add0
-    next_v1[1] += add1
-    add0, add1 = zipper_merge(next_v0[3], next_v0[2])
-    next_v1[2] += add0
-    next_v1[3] += add1
+    next_v0 += zipper_merge(next_v1)
+    next_v1 += zipper_merge(next_v0)
     return (next_v0, next_v1, next_mul0, next_mul1)
 
 
@@ -62,21 +48,16 @@ def initial_state(key: U64x4) -> Tuple[U64x4, U64x4, U64x4, U64x4]:
     init1[1] = 0xc0acf169b5f18a8c
     init1[2] = 0xbe5466cf34e90c6c
     init1[3] = 0x452821e638d01377
-    var rotated = U64x4(0)
-    for i in range(4):
-        rotated[i] = rotate64_by32(key[i])
+    var rotated = rotate64x4_by32(key)
     return (init0 ^ key, init1 ^ rotated, init0, init1)
 
 
 def rotate_remainder(v: U64x4, count: Int) -> U64x4:
-    var result = v
-    for i in range(4):
-        var lo = v[i] & MASK32
-        var hi = v[i] >> 32
-        lo = ((lo << UInt64(count)) | (lo >> UInt64(32 - count))) & MASK32
-        hi = ((hi << UInt64(count)) | (hi >> UInt64(32 - count))) & MASK32
-        result[i] = lo | (hi << 32)
-    return result
+    var lo = v & U64x4(MASK32)
+    var hi = v >> 32
+    lo = ((lo << UInt64(count)) | (lo >> UInt64(32 - count))) & U64x4(MASK32)
+    hi = ((hi << UInt64(count)) | (hi >> UInt64(32 - count))) & U64x4(MASK32)
+    return lo | (hi << 32)
 
 
 def remainder_packet(bytes: U8Ptr, length: Int) -> U64x4:
@@ -129,11 +110,7 @@ def reduce_mod(a3_unmasked: UInt64, a2: UInt64, a1: UInt64,
 def mhh64(key: Int, data: Int, n: Int, result: Int) abi("C"):
     var v0, v1, mul0, mul1 = process(key, data, n)
     for _ in range(4):
-        var packet = U64x4(0)
-        packet[0] = rotate64_by32(v0[2])
-        packet[1] = rotate64_by32(v0[3])
-        packet[2] = rotate64_by32(v0[0])
-        packet[3] = rotate64_by32(v0[1])
+        var packet = rotate64x4_by32(v0.shuffle[2, 3, 0, 1]())
         v0, v1, mul0, mul1 = update(v0, v1, mul0, mul1, packet)
     U64Ptr(unsafe_from_address=result)[0] = v0[0] + v1[0] + mul0[0] + mul1[0]
 
@@ -142,11 +119,7 @@ def mhh64(key: Int, data: Int, n: Int, result: Int) abi("C"):
 def mhh128(key: Int, data: Int, n: Int, result: Int) abi("C"):
     var v0, v1, mul0, mul1 = process(key, data, n)
     for _ in range(6):
-        var packet = U64x4(0)
-        packet[0] = rotate64_by32(v0[2])
-        packet[1] = rotate64_by32(v0[3])
-        packet[2] = rotate64_by32(v0[0])
-        packet[3] = rotate64_by32(v0[1])
+        var packet = rotate64x4_by32(v0.shuffle[2, 3, 0, 1]())
         v0, v1, mul0, mul1 = update(v0, v1, mul0, mul1, packet)
     var dst = U64Ptr(unsafe_from_address=result)
     dst[0] = v0[0] + mul0[0] + v1[2] + mul1[2]
@@ -157,11 +130,7 @@ def mhh128(key: Int, data: Int, n: Int, result: Int) abi("C"):
 def mhh256(key: Int, data: Int, n: Int, result: Int) abi("C"):
     var v0, v1, mul0, mul1 = process(key, data, n)
     for _ in range(10):
-        var packet = U64x4(0)
-        packet[0] = rotate64_by32(v0[2])
-        packet[1] = rotate64_by32(v0[3])
-        packet[2] = rotate64_by32(v0[0])
-        packet[3] = rotate64_by32(v0[1])
+        var packet = rotate64x4_by32(v0.shuffle[2, 3, 0, 1]())
         v0, v1, mul0, mul1 = update(v0, v1, mul0, mul1, packet)
     var dst = U64Ptr(unsafe_from_address=result)
     dst[1], dst[0] = reduce_mod(v1[1] + mul1[1], v1[0] + mul1[0],

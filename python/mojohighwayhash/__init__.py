@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import numpy as np
+import ctypes
 
 from ._lib import lib
 
 __version__ = "0.1.0"
 __all__ = ["highwayhash_64", "highwayhash_128", "highwayhash_256"]
 
-# NumPy permits zero-length arrays to have an implementation-defined data pointer.
-# The Mojo ABI uses an address even for empty input, so keep a concrete byte alive
-# and use its non-null address in that case.
-_EMPTY_DATA = np.zeros(1, dtype=np.uint8)
+_bytes_address = ctypes.pythonapi.PyBytes_AsString
+_bytes_address.argtypes = [ctypes.py_object]
+_bytes_address.restype = ctypes.c_void_p
+_new_bytes = ctypes.pythonapi.PyBytes_FromStringAndSize
+_new_bytes.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t]
+_new_bytes.restype = ctypes.py_object
 
 
 def _process_in(key: bytes, data: bytes) -> tuple[bytes, bytes]:
@@ -27,13 +29,14 @@ def _process_in(key: bytes, data: bytes) -> tuple[bytes, bytes]:
 
 def _hash(symbol: str, key: bytes, data: bytes, words: int) -> bytes:
     key, data = _process_in(key, data)
-    key_array = np.frombuffer(key, dtype=np.uint8)
-    data_array = np.frombuffer(data, dtype=np.uint8)
-    result = np.empty(words, dtype=np.uint64)
-    data_address = data_array.ctypes.data if data_array.size else _EMPTY_DATA.ctypes.data
-    # All arrays remain strongly referenced until the native call has returned.
-    getattr(lib(), symbol)(key_array.ctypes.data, data_address, len(data), result.ctypes.data)
-    return result.tobytes()
+    result = _new_bytes(None, words * 8)
+    getattr(lib(), symbol)(
+        _bytes_address(key),
+        _bytes_address(data),
+        len(data),
+        _bytes_address(result),
+    )
+    return result
 
 
 def highwayhash_64(key: bytes, data: bytes) -> bytes:
